@@ -30,15 +30,15 @@ class RobotController:
         # Robot Size (For obstacle avoidance)
         self.safe_distance = 0.5  
 
-        # 🌟 Target color dynamically assigned before competition
+        # Target color can be red or green
         self.target_color = rospy.get_param('~target_color', 'red') 
 
         # HSV Color Ranges
+        # Black range is for line detection; red/green for object detection
         self.color_ranges = {
-            'black': ([0, 0, 0], [180, 255, 50]),  # Line detection
+            'black': ([0, 0, 0], [180, 255, 50]),   # Line detection
             'red': ([0, 100, 100], [10, 255, 255]),
-            'green': ([40, 100, 100], [70, 255, 255]),
-            'blue': ([90, 100, 100], [130, 255, 255])
+            'green': ([40, 100, 100], [70, 255, 255])
         }
 
     def image_callback(self, data):
@@ -50,7 +50,7 @@ class RobotController:
         height, width, _ = cv_image.shape
         cropped_hsv = hsv[int(height * 0.6):height, :]
 
-        # 🔹 1️⃣ Line Following (Black Line)
+        # 1️⃣ Line Following (Black Line)
         lower_black, upper_black = self.color_ranges['black']
         mask_line = cv2.inRange(cropped_hsv, np.array(lower_black), np.array(upper_black))
         M_line = cv2.moments(mask_line)
@@ -61,11 +61,13 @@ class RobotController:
             self.twist.linear.x = 0.15
             self.twist.angular.z = -float(error) / 200
         else:
+            # If line is lost, rotate to search for it
             self.twist.linear.x = 0
-            self.twist.angular.z = 0.3  # Rotate to find line again
+            self.twist.angular.z = 0.3
 
-        # 🔹 2️⃣ Object Detection (Red, Green, Blue)
-        for color in ['red', 'green', 'blue']:
+        # 2️⃣ Object Detection (Red, Green)
+        # Loop through just 'red' and 'green' instead of 'blue'
+        for color in ['red', 'green']:
             lower, upper = self.color_ranges[color]
             mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -74,16 +76,18 @@ class RobotController:
                 biggest_contour = max(contours, key=cv2.contourArea)
                 area = cv2.contourArea(biggest_contour)
 
-                if area > 600:  # Only process significant objects
+                # Only process significant objects
+                if area > 600:
                     x, y, w, h = cv2.boundingRect(biggest_contour)
                     obj_center_x = x + w // 2
                     offset = obj_center_x - width // 2
 
-                    # 🔴 🟢 🔵 If it’s the target color, move it to the deploy zone!
+                    # If it’s the target color, move it to the deploy zone
                     if color == self.target_color:
                         rospy.loginfo(f"🎯 {color.upper()} object detected! Moving to deploy zone...")
                         self.pickup_object()
                     else:
+                        # If it's not the target color, push it away
                         rospy.loginfo(f"🚫 {color.upper()} is NOT the target! Pushing it away...")
                         self.push_object(offset)
 
@@ -97,8 +101,9 @@ class RobotController:
         else:
             self.twist.angular.z = 0
 
-        # Push object aside
-        self.twist.linear.x = 0.05  # Move forward slowly
+        # Move forward slowly to push
+        self.twist.linear.x = 0.05
+        self.cmd_pub.publish(self.twist)
         rospy.sleep(2)
         self.twist.linear.x = 0.0
         self.cmd_pub.publish(self.twist)
@@ -112,7 +117,8 @@ class RobotController:
             self.twist.linear.x = 0.0
             self.twist.angular.z = 0.5  # Turn away
         else:
-            self.twist.linear.x = 0.15  # Continue moving
+            # Continue moving if no obstacle is too close
+            self.twist.linear.x = 0.15
 
         self.cmd_pub.publish(self.twist)
 
@@ -133,6 +139,10 @@ class RobotController:
         rospy.loginfo("📤 Releasing object...")
         self.gripper_pub.publish(0.0)  # Open gripper
         rospy.sleep(2)
+
+    def object_callback(self, msg):
+        """Optional callback if you have a separate node publishing detected object info."""
+        rospy.loginfo(f"Object callback received: {msg.data}")
 
     def run(self):
         rospy.spin()
