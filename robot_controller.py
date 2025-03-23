@@ -8,6 +8,8 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import Float64, String
 from cv_bridge import CvBridge
 
+# rosrun your_package robot_controller.py _target_color:=red
+
 class RobotController:
     def __init__(self):
         rospy.init_node('robot_controller')
@@ -27,118 +29,133 @@ class RobotController:
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
-        # Robot Size (For obstacle avoidance)
-        self.safe_distance = 0.5  
-
-        # Target color can be red or green
-        self.target_color = rospy.get_param('~target_color', 'red') 
+        # Robot State
+        self.safe_distance = 0.5
+        self.target_color = rospy.get_param('~target_color', 'green')  # Default to green
+        self.is_handling_object = False
+        self.object_detected = False
 
         # HSV Color Ranges
-        # Black range is for line detection; red/green for object detection
         self.color_ranges = {
-            'black': ([0, 0, 0], [180, 255, 50]),   # Line detection
+            'black': ([0, 0, 0], [180, 255, 50]),    # Line detection
             'red': ([0, 100, 100], [10, 255, 255]),
-            'green': ([40, 100, 100], [70, 255, 255])
+            'green': ([40, 100, 100], [80, 255, 255])
         }
+
+        # Object detection parameters
+        self.min_object_area = 1000  # Minimum area to consider as an object
+        self.max_object_area = 50000  # Maximum area to consider as an object
+        self.object_center_threshold = 30  # Pixels from center to consider object centered
 
     def image_callback(self, data):
         """Processes camera feed for line following & object detection."""
         cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-
-        # Crop Image to Exclude Gripper Interference
         height, width, _ = cv_image.shape
-        cropped_hsv = hsv[int(height * 0.6):height, :]
 
-        # 1️⃣ Line Following (Black Line)
-        lower_black, upper_black = self.color_ranges['black']
-        mask_line = cv2.inRange(cropped_hsv, np.array(lower_black), np.array(upper_black))
-        M_line = cv2.moments(mask_line)
+        # First priority: Line following
+        if not self.is_handling_object:
+            # Crop image to focus on line detection area
+            line_roi = hsv[int(height * 0.7):height, :]
+            lower_black, upper_black = self.color_ranges['black']
+            mask_line = cv2.inRange(line_roi, np.array(lower_black), np.array(upper_black))
+            M_line = cv2.moments(mask_line)
 
-        if M_line['m00'] > 0:
-            cx_line = int(M_line['m10'] / M_line['m00'])
-            error = cx_line - width // 2
-            self.twist.linear.x = 0.15
-            self.twist.angular.z = -float(error) / 200
-        else:
-            # If line is lost, rotate to search for it
-            self.twist.linear.x = 0
-            self.twist.angular.z = 0.3
+            if M_line['m00'] > 0:
+                cx_line = int(M_line['m10'] / M_line['m00'])
+                error = cx_line - width // 2
+                self.twist.linear.x = 0.15
+                self.twist.angular.z = -float(error) / 200
+            else:
+                # If line is lost, slow down and search
+                self.twist.linear.x = 0.05
+                self.twist.angular.z = 0.3
 
-        # 2️⃣ Object Detection (Red, Green)
-        # Loop through just 'red' and 'green' instead of 'blue'
-        for color in ['red', 'green']:
-            lower, upper = self.color_ranges[color]
-            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        # Second priority: Object detection
+        if not self.is_handling_object:
+            for color in ['red', 'green']:
+                lower, upper = self.color_ranges[color]
+                mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            if contours:
-                biggest_contour = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(biggest_contour)
+                if contours:
+                    # Find the largest contour that meets our size criteria
+                    valid_contours = [cnt for cnt in contours 
+                                    if self.min_object_area < cv2.contourArea(cnt) < self.max_object_area]
+                    
+                    if valid_contours:
+                        biggest_contour = max(valid_contours, key=cv2.contourArea)
+                        x, y, w, h = cv2.boundingRect(biggest_contour)
+                        obj_center_x = x + w // 2
+                        offset = obj_center_x - width // 2
 
-                # Only process significant objects
-                if area > 600:
-                    x, y, w, h = cv2.boundingRect(biggest_contour)
-                    obj_center_x = x + w // 2
-                    offset = obj_center_x - width // 2
-
-                    # If it’s the target color, move it to the deploy zone
-                    if color == self.target_color:
-                        rospy.loginfo(f"🎯 {color.upper()} object detected! Moving to deploy zone...")
-                        self.pickup_object()
-                    else:
-                        # If it's not the target color, push it away
-                        rospy.loginfo(f"🚫 {color.upper()} is NOT the target! Pushing it away...")
-                        self.push_object(offset)
+                        # Check if object is centered enough
+                        if abs(offset) < self.object_center_threshold:
+                            self.object_detected = True
+                            if color == self.target_color:
+                                rospy.loginfo(f"🎯 Target {color.upper()} object detected! Picking up...")
+                                self.handle_target_object()
+                            else:
+                                rospy.loginfo(f"🚫 Non-target {color.upper()} object detected! Pushing away...")
+                                self.handle_non_target_object()
 
         # Publish movement command
         self.cmd_pub.publish(self.twist)
 
-    def push_object(self, offset):
-        """Pushes non-target objects out of the way."""
-        if abs(offset) > 20:
-            self.twist.angular.z = -0.002 * offset  # Align to object
-        else:
-            self.twist.angular.z = 0
+    def handle_target_object(self):
+        """Handles picking up the target colored object."""
+        self.is_handling_object = True
+        self.twist.linear.x = 0.0
+        self.twist.angular.z = 0.0
+        self.cmd_pub.publish(self.twist)
+        
+        # Close gripper
+        self.gripper_pub.publish(1.0)
+        rospy.sleep(2)
+        
+        # Move to deposit zone
+        self.twist.linear.x = 0.3
+        self.cmd_pub.publish(self.twist)
+        rospy.sleep(3)
+        
+        # Release object
+        self.gripper_pub.publish(0.0)
+        rospy.sleep(2)
+        
+        self.is_handling_object = False
+        self.object_detected = False
 
-        # Move forward slowly to push
-        self.twist.linear.x = 0.05
+    def handle_non_target_object(self):
+        """Handles pushing away non-target colored objects."""
+        self.is_handling_object = True
+        self.twist.linear.x = 0.0
+        self.twist.angular.z = 0.0
+        self.cmd_pub.publish(self.twist)
+        
+        # Push object away
+        self.twist.linear.x = 0.1
         self.cmd_pub.publish(self.twist)
         rospy.sleep(2)
-        self.twist.linear.x = 0.0
+        
+        # Back up slightly
+        self.twist.linear.x = -0.1
         self.cmd_pub.publish(self.twist)
+        rospy.sleep(1)
+        
+        self.is_handling_object = False
+        self.object_detected = False
 
     def lidar_callback(self, msg):
         """Handles obstacle detection using LiDAR."""
+        if self.is_handling_object:
+            return  # Ignore LiDAR during object handling
+            
         min_distance = min(msg.ranges)
-
         if min_distance < self.safe_distance:
             rospy.logwarn("🚧 Obstacle detected! Adjusting path...")
             self.twist.linear.x = 0.0
             self.twist.angular.z = 0.5  # Turn away
-        else:
-            # Continue moving if no obstacle is too close
-            self.twist.linear.x = 0.15
-
-        self.cmd_pub.publish(self.twist)
-
-    def pickup_object(self):
-        """Activates gripper to pick up the correct object."""
-        rospy.loginfo("🤖 Picking up object...")
-        self.gripper_pub.publish(1.0)  # Close gripper
-        rospy.sleep(2)
-        self.deposit_object()
-
-    def deposit_object(self):
-        """Moves robot to deposit zone and releases object."""
-        rospy.loginfo("📦 Moving to deploy zone...")
-        self.twist.linear.x = 0.3
-        self.cmd_pub.publish(self.twist)
-        rospy.sleep(3)
-
-        rospy.loginfo("📤 Releasing object...")
-        self.gripper_pub.publish(0.0)  # Open gripper
-        rospy.sleep(2)
+            self.cmd_pub.publish(self.twist)
 
     def object_callback(self, msg):
         """Optional callback if you have a separate node publishing detected object info."""
