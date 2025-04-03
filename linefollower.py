@@ -5,6 +5,7 @@ import numpy as np
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
+import datetime
 
 class LineFollower:
     def __init__(self):
@@ -39,10 +40,13 @@ class LineFollower:
         height, width, _ = cv_image.shape
 
         # Crop the image to the lower part (where the line should be)
-        crop_img = hsv[int(height * 0.6):height, :]
+        crop_img = hsv[int(height * 0.0001):height, :]
 
         # Create a mask for black color using the defined range
         mask = cv2.inRange(crop_img, self.lower_black, self.upper_black)
+        timenow = datetime.datetime.now()
+
+        cv2.imshow("mask", mask)
 
         # Calculate moments of the mask to get the center of mass
         M = cv2.moments(mask)
