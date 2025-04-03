@@ -10,7 +10,7 @@ from cv_bridge import CvBridge
 
 class RobotController:
     def __init__(self):
-        rospy.init_node('robot_controller')
+        rospy.init_node('robot_controller', anonymous=True)
 
         # Publishers
         self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
@@ -23,133 +23,150 @@ class RobotController:
         rospy.Subscriber('/scan', LaserScan, self.lidar_callback)
         rospy.Subscriber('/detected_object', String, self.object_callback)
 
-        # TF Buffer
+        # TF Buffer (for potential transforms)
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
-        # Robot Size (For obstacle avoidance)
-        self.safe_distance = 0.5  
-
-        # Target color can be red or green
-        self.target_color = rospy.get_param('~target_color', 'red') 
-
-        # HSV Color Ranges
-        # Black range is for line detection; red/green for object detection
+        # Parameters and color thresholds
+        self.safe_distance = 0.5  # meters for LiDAR obstacle avoidance
+        self.target_color = rospy.get_param('~target_color', 'red')  # target object color
         self.color_ranges = {
-            'black': ([0, 0, 0], [180, 255, 50]),   # Line detection
+            'black': ([0, 0, 0], [180, 255, 50]),   # Used for line detection
             'red': ([0, 100, 100], [10, 255, 255]),
             'green': ([40, 100, 100], [70, 255, 255])
         }
 
+        # State variables for behavior control
+        self.state = 'line_following'
+        self.last_state_change = rospy.Time.now()
+        self.line_detected = False
+        self.line_error = 0
+        self.push_offset = 0
+
+        # Timer to manage state-based actions (10 Hz)
+        rospy.Timer(rospy.Duration(0.1), self.state_manager)
+
     def image_callback(self, data):
-        """Processes camera feed for line following & object detection."""
-        cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        """Processes camera feed for line following and colored object detection."""
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        except Exception as e:
+            rospy.logerr("CV Bridge error: {}".format(e))
+            return
+
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-
-        # Crop Image to Exclude Gripper Interference
         height, width, _ = cv_image.shape
-        cropped_hsv = hsv[int(height * 0.6):height, :]
 
-        # 1️⃣ Line Following (Black Line)
+        # --- Line Detection ---
+        # Crop to the lower portion of the image to minimize interference.
+        cropped_hsv = hsv[int(height * 0.6):height, :]
         lower_black, upper_black = self.color_ranges['black']
         mask_line = cv2.inRange(cropped_hsv, np.array(lower_black), np.array(upper_black))
         M_line = cv2.moments(mask_line)
 
         if M_line['m00'] > 0:
             cx_line = int(M_line['m10'] / M_line['m00'])
-            error = cx_line - width // 2
-            self.twist.linear.x = 0.15
-            self.twist.angular.z = -float(error) / 200
+            self.line_detected = True
+            self.line_error = cx_line - (width // 2)
         else:
-            # If line is lost, rotate to search for it
-            self.twist.linear.x = 0
-            self.twist.angular.z = 0.3
+            self.line_detected = False
+            self.line_error = 0
 
-        # 2️⃣ Object Detection (Red, Green)
-        # Loop through just 'red' and 'green' instead of 'blue'
-        for color in ['red', 'green']:
-            lower, upper = self.color_ranges[color]
-            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-            if contours:
-                biggest_contour = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(biggest_contour)
-
-                # Only process significant objects
-                if area > 600:
-                    x, y, w, h = cv2.boundingRect(biggest_contour)
-                    obj_center_x = x + w // 2
-                    offset = obj_center_x - width // 2
-
-                    # If it’s the target color, move it to the deploy zone
-                    if color == self.target_color:
-                        rospy.loginfo(f"🎯 {color.upper()} object detected! Moving to deploy zone...")
-                        self.pickup_object()
-                    else:
-                        # If it's not the target color, push it away
-                        rospy.loginfo(f"🚫 {color.upper()} is NOT the target! Pushing it away...")
-                        self.push_object(offset)
-
-        # Publish movement command
-        self.cmd_pub.publish(self.twist)
-
-    def push_object(self, offset):
-        """Pushes non-target objects out of the way."""
-        if abs(offset) > 20:
-            self.twist.angular.z = -0.002 * offset  # Align to object
-        else:
-            self.twist.angular.z = 0
-
-        # Move forward slowly to push
-        self.twist.linear.x = 0.05
-        self.cmd_pub.publish(self.twist)
-        rospy.sleep(2)
-        self.twist.linear.x = 0.0
-        self.cmd_pub.publish(self.twist)
+        # --- Colored Object Detection ---
+        # Only process objects when in the default (line-following) state.
+        if self.state == 'line_following':
+            for color in ['red', 'green']:
+                lower, upper = self.color_ranges[color]
+                mask_color = cv2.inRange(hsv, np.array(lower), np.array(upper))
+                contours, _ = cv2.findContours(mask_color, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    area = cv2.contourArea(largest_contour)
+                    if area > 600:  # Only process significant objects
+                        x, y, w, h = cv2.boundingRect(largest_contour)
+                        obj_center_x = x + w // 2
+                        offset = obj_center_x - (width // 2)
+                        if color == self.target_color:
+                            rospy.loginfo(f"🎯 {color.upper()} object detected! Initiating pickup sequence.")
+                            self.state = 'pickup_object'
+                            self.last_state_change = rospy.Time.now()
+                            break
+                        else:
+                            rospy.loginfo(f"🚫 {color.upper()} object detected! Initiating push sequence.")
+                            self.push_offset = offset
+                            self.state = 'push_object'
+                            self.last_state_change = rospy.Time.now()
+                            break
 
     def lidar_callback(self, msg):
-        """Handles obstacle detection using LiDAR."""
-        min_distance = min(msg.ranges)
-
-        if min_distance < self.safe_distance:
-            rospy.logwarn("🚧 Obstacle detected! Adjusting path...")
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5  # Turn away
-        else:
-            # Continue moving if no obstacle is too close
-            self.twist.linear.x = 0.15
-
-        self.cmd_pub.publish(self.twist)
-
-    def pickup_object(self):
-        """Activates gripper to pick up the correct object."""
-        rospy.loginfo("🤖 Picking up object...")
-        self.gripper_pub.publish(1.0)  # Close gripper
-        rospy.sleep(2)
-        self.deposit_object()
-
-    def deposit_object(self):
-        """Moves robot to deposit zone and releases object."""
-        rospy.loginfo("📦 Moving to deploy zone...")
-        self.twist.linear.x = 0.3
-        self.cmd_pub.publish(self.twist)
-        rospy.sleep(3)
-
-        rospy.loginfo("📤 Releasing object...")
-        self.gripper_pub.publish(0.0)  # Open gripper
-        rospy.sleep(2)
+        """Processes LiDAR data for obstacle avoidance."""
+        # Filter out invalid readings.
+        valid_ranges = [r for r in msg.ranges if msg.range_min <= r <= msg.range_max]
+        if valid_ranges:
+            min_distance = min(valid_ranges)
+            if min_distance < self.safe_distance and self.state != 'avoid_obstacle':
+                rospy.logwarn("🚧 Obstacle detected! Initiating avoidance maneuver.")
+                self.previous_state = self.state  # Save current state
+                self.state = 'avoid_obstacle'
+                self.last_state_change = rospy.Time.now()
 
     def object_callback(self, msg):
-        """Optional callback if you have a separate node publishing detected object info."""
+        """Optional callback for externally provided object information."""
         rospy.loginfo(f"Object callback received: {msg.data}")
+
+    def state_manager(self, event):
+        """State machine handling robot behavior."""
+        current_time = rospy.Time.now()
+
+        if self.state == 'line_following':
+            # Follow the line if detected; otherwise, rotate to search for it.
+            if self.line_detected:
+                self.twist.linear.x = 0.15
+                self.twist.angular.z = -float(self.line_error) / 200.0
+            else:
+                self.twist.linear.x = 0.0
+                self.twist.angular.z = 0.3
+            self.cmd_pub.publish(self.twist)
+
+        elif self.state == 'push_object':
+            # Push the non-target object for a fixed duration.
+            if (current_time - self.last_state_change) < rospy.Duration(2.0):
+                self.twist.linear.x = 0.05
+                self.twist.angular.z = -0.002 * self.push_offset
+                self.cmd_pub.publish(self.twist)
+            else:
+                self.twist.linear.x = 0.0
+                self.twist.angular.z = 0.0
+                self.cmd_pub.publish(self.twist)
+                self.state = 'line_following'
+                self.last_state_change = current_time
+
+        elif self.state == 'pickup_object':
+            # Simulate picking up the target object by closing the gripper.
+            if (current_time - self.last_state_change) < rospy.Duration(2.0):
+                self.gripper_pub.publish(1.0)  # Close gripper
+            else:
+                # After pickup, transition back to line following.
+                self.state = 'line_following'
+                self.last_state_change = current_time
+
+        elif self.state == 'avoid_obstacle':
+            # Rotate to avoid the obstacle.
+            if (current_time - self.last_state_change) < rospy.Duration(1.0):
+                self.twist.linear.x = 0.0
+                self.twist.angular.z = 0.5
+                self.cmd_pub.publish(self.twist)
+            else:
+                # Return to previous state (or default to line following).
+                self.state = getattr(self, 'previous_state', 'line_following')
+                self.last_state_change = current_time
 
     def run(self):
         rospy.spin()
 
 if __name__ == '__main__':
     try:
-        node = RobotController()
-        node.run()
+        controller = RobotController()
+        controller.run()
     except rospy.ROSInterruptException:
         pass
