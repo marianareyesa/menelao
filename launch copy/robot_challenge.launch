@@ -1,0 +1,11 @@
+<launch>
+    <!-- Start camera node -->
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+        <arg name="align_depth" value="true"/>
+    </include>
+
+    <!-- Start robot controller with dynamic target color -->
+    <node pkg="menelao_challenge" type="robot_controller.py" name="robot_controller" output="screen">
+        <param name="target_color" value="$(arg color)"/>
+    </node>
+</launch>

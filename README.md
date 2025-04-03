@@ -1,2 +1,2 @@
 # menelao
-roslaunch robot_challenge robot_challenge.launch color:=green
+roslaunch menelao_challenge robot_challenge.launch color:=green
