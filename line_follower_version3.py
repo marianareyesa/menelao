@@ -24,16 +24,20 @@ class LineFollower:
 
         # HSV range for line detection (black)
         self.lower_black = np.array([0, 0, 0])
-        self.upper_black = np.array([180, 255, 60])  # tightened upper V to avoid background dark spots
+        self.upper_black = np.array([180, 255, 60])
 
         # Movement parameters
-        self.linear_vel_base = 0.15   # forward speed when centered
-        self.turn_linear = 0.08       # small forward during turns
-        self.angular_vel_base = 0.4   # turning speed
-        self.min_lin = 0.05           # minimum forward to overcome stiction
+        self.linear_vel_base = 0.15
+        self.turn_linear = 0.08
+        self.angular_vel_base = 0.4
+        self.min_lin = 0.05
 
         # Morphological kernel to reduce noise
         self.kernel = np.ones((5,5), np.uint8)
+
+        # Lost-line debounce
+        self.lost_count = 0
+        self.lost_threshold = 3  # frames before recovery
 
         # Save images directory
         self.image_save_dir = '/local/student/catkin_ws/src/menelao_challenge/tmp/'
@@ -41,13 +45,12 @@ class LineFollower:
         self.save_interval = 5
         self.last_saved_time = rospy.Time.now()
 
-        # Previous turn direction (-1 right, +1 left)
+        # Previous turn direction
         self.last_dir = 1
 
-        rospy.loginfo("Enhanced square-corner line follower started... v4")
+        rospy.loginfo("Line follower v5 with debounce started...")
 
     def image_callback(self, msg):
-        # Reset twist for this frame
         self.twist = Twist()
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -58,48 +61,41 @@ class LineFollower:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]
 
-        # ROI: bottom 35% for main line detection
-        y0 = int(h * 0.65)
+        # ROI: bottom 20% for line detection to detect only close edges
+        y0 = int(h * 0.8)
         crop = hsv[y0:, :]
 
-        # Mask and clean-up
         mask_roi = cv2.inRange(crop, self.lower_black, self.upper_black)
         mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_OPEN, self.kernel)
         mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, self.kernel)
 
-        # Flag to indicate detection
-        detected = False
-
-        # Find contours in ROI
         contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detected = False
         if contours:
             cnt = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(cnt)
-            # Ensure this is the line, not noise
-            if area > 200:
+            if cv2.contourArea(cnt) > 200:
                 M = cv2.moments(cnt)
                 if M['m00'] > 0:
                     cx = int(M['m10']/M['m00'])
-                    # Normalize error [-1,1]
                     err = (cx - w/2) / (w/2)
-                    # Proportional control
                     lin = self.linear_vel_base * (1 - abs(err))
                     ang = -err * self.angular_vel_base
-                    # Enforce minimum forward
                     self.twist.linear.x = max(self.min_lin, lin)
                     self.twist.angular.z = ang
-                    # Slight forward while turning
                     if abs(ang) > 0.2:
                         self.twist.linear.x = self.turn_linear
-                    # Update last direction
                     self.last_dir = 1 if ang > 0 else -1
                     detected = True
 
-        # If no valid contour in ROI, recover at corners
-        if not detected:
+        # Debounce lost-line: only recover after threshold
+        if detected:
+            self.lost_count = 0
+        else:
+            self.lost_count += 1
+
+        if self.lost_count >= self.lost_threshold:
             self._recover(hsv, w)
 
-        # Publish command for this frame
         self.cmd_pub.publish(self.twist)
 
         # Debug view
@@ -113,31 +109,23 @@ class LineFollower:
             self.last_saved_time = now
 
     def _recover(self, hsv, width):
-        """
-        Recovery at square corners: analyze left/right halves of full frame and include forward motion
-        """
         full_mask = cv2.inRange(hsv, self.lower_black, self.upper_black)
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, self.kernel)
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, self.kernel)
 
-        # Split into left and right halves
         mid = width // 2
-        left_sum = int(np.sum(full_mask[:, :mid]))
-        right_sum = int(np.sum(full_mask[:, mid:]))
+        left_sum = np.sum(full_mask[:, :mid])
+        right_sum = np.sum(full_mask[:, mid:])
 
-        # Decide turn direction based on greater presence
         if left_sum > right_sum and left_sum > 1000:
-            # More line in left half: rotate + forward
             self.twist.linear.x = self.turn_linear
             self.twist.angular.z = self.angular_vel_base
             self.last_dir = 1
         elif right_sum > left_sum and right_sum > 1000:
-            # More line in right half: rotate + forward
             self.twist.linear.x = self.turn_linear
             self.twist.angular.z = -self.angular_vel_base
             self.last_dir = -1
         else:
-            # If still ambiguous, spin in last_dir with small forward
             self.twist.linear.x = self.turn_linear * 0.5
             self.twist.angular.z = self.angular_vel_base * self.last_dir * 0.5
 
