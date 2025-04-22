@@ -44,10 +44,10 @@ class LineFollower:
         # Previous turn direction (-1 right, +1 left)
         self.last_dir = 1
 
-        rospy.loginfo("Enhanced square-corner line follower started...")
+        rospy.loginfo("Enhanced square-corner line follower started... v4")
 
     def image_callback(self, msg):
-        # Initialize twist for this frame
+        # Reset twist for this frame
         self.twist = Twist()
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -63,12 +63,15 @@ class LineFollower:
         crop = hsv[y0:, :]
 
         # Mask and clean-up
-        mask = cv2.inRange(crop, self.lower_black, self.upper_black)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
+        mask_roi = cv2.inRange(crop, self.lower_black, self.upper_black)
+        mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_OPEN, self.kernel)
+        mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, self.kernel)
+
+        # Flag to indicate detection
+        detected = False
 
         # Find contours in ROI
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             cnt = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(cnt)
@@ -90,15 +93,17 @@ class LineFollower:
                         self.twist.linear.x = self.turn_linear
                     # Update last direction
                     self.last_dir = 1 if ang > 0 else -1
-                return
-        # If we get here, ROI didn't find the line: recover
-        self._recover(hsv, w)
+                    detected = True
 
-        # Publish command
+        # If no valid contour in ROI, recover at corners
+        if not detected:
+            self._recover(hsv, w)
+
+        # Publish command for this frame
         self.cmd_pub.publish(self.twist)
 
         # Debug view
-        cv2.imshow("ROI Mask", mask)
+        cv2.imshow("ROI Mask", mask_roi)
         cv2.waitKey(1)
 
         # Periodic save
@@ -109,7 +114,7 @@ class LineFollower:
 
     def _recover(self, hsv, width):
         """
-        Recovery at square corners: analyze left/right halves of full frame
+        Recovery at square corners: analyze left/right halves of full frame and include forward motion
         """
         full_mask = cv2.inRange(hsv, self.lower_black, self.upper_black)
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, self.kernel)
@@ -117,25 +122,23 @@ class LineFollower:
 
         # Split into left and right halves
         mid = width // 2
-        left = full_mask[:, :mid]
-        right = full_mask[:, mid:]
-        left_sum = np.sum(left)
-        right_sum = np.sum(right)
+        left_sum = int(np.sum(full_mask[:, :mid]))
+        right_sum = int(np.sum(full_mask[:, mid:]))
 
         # Decide turn direction based on greater presence
-        if left_sum > right_sum and left_sum > 5000:
-            # More line in left half: rotate left
-            self.twist.linear.x = 0.0
+        if left_sum > right_sum and left_sum > 1000:
+            # More line in left half: rotate + forward
+            self.twist.linear.x = self.turn_linear
             self.twist.angular.z = self.angular_vel_base
             self.last_dir = 1
-        elif right_sum > left_sum and right_sum > 5000:
-            # More line in right half: rotate right
-            self.twist.linear.x = 0.0
+        elif right_sum > left_sum and right_sum > 1000:
+            # More line in right half: rotate + forward
+            self.twist.linear.x = self.turn_linear
             self.twist.angular.z = -self.angular_vel_base
             self.last_dir = -1
         else:
-            # If unsure, spin based on last_dir
-            self.twist.linear.x = 0.0
+            # If still ambiguous, spin in last_dir with small forward
+            self.twist.linear.x = self.turn_linear * 0.5
             self.twist.angular.z = self.angular_vel_base * self.last_dir * 0.5
 
     def _save_image(self, img):
