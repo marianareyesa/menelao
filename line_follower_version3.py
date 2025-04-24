@@ -22,22 +22,20 @@ class LineFollower:
         # Subscriber for camera images
         rospy.Subscriber('/camera/color/image_raw', Image, self.image_callback)
 
-        # HSV range for line detection (black)
+        # HSV range for line detection
         self.lower_black = np.array([0, 0, 0])
-        self.upper_black = np.array([180, 255, 60])
+        self.upper_black = np.array([180, 255, 80])
 
         # Movement parameters
-        self.linear_vel_base = 0.15
-        self.turn_linear = 0.08
-        self.angular_vel_base = 0.4
-        self.min_lin = 0.05
+        self.linear_vel_base = 0.15  # forward speed when centered
+        self.angular_vel_base = 0.3  # turning speed
+        self.turn_linear = 0.05      # small forward during turns
+
+        # Last direction for recovery (-1 right, +1 left)
+        self.last_dir = 1
 
         # Morphological kernel to reduce noise
         self.kernel = np.ones((5,5), np.uint8)
-
-        # Lost-line debounce
-        self.lost_count = 0
-        self.lost_threshold = 3  # frames before recovery
 
         # Save images directory
         self.image_save_dir = '/local/student/catkin_ws/src/menelao_challenge/tmp/'
@@ -45,13 +43,9 @@ class LineFollower:
         self.save_interval = 5
         self.last_saved_time = rospy.Time.now()
 
-        # Previous turn direction
-        self.last_dir = 1
-
-        rospy.loginfo("Line follower v5 with debounce started...")
+        rospy.loginfo("Contour-based adaptive line follower started...")
 
     def image_callback(self, msg):
-        self.twist = Twist()
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
@@ -61,75 +55,73 @@ class LineFollower:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]
 
-        # ROI: bottom 20% for line detection to detect only close edges
-        y0 = int(h * 0.8)
+        # ROI: bottom 25% for main line detection
+        y0 = int(h * 0.75)
         crop = hsv[y0:, :]
 
-        mask_roi = cv2.inRange(crop, self.lower_black, self.upper_black)
-        mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_OPEN, self.kernel)
-        mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, self.kernel)
+        # Mask and clean-up
+        mask = cv2.inRange(crop, self.lower_black, self.upper_black)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
 
-        contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        detected = False
+        # Find contours in ROI
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
+            # Select the largest contour by area
             cnt = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(cnt) > 200:
+            area = cv2.contourArea(cnt)
+            if area > 100:  # ignore small blobs
+                # Compute centroid of contour
                 M = cv2.moments(cnt)
                 if M['m00'] > 0:
                     cx = int(M['m10']/M['m00'])
+                    # Normalize error
                     err = (cx - w/2) / (w/2)
-                    lin = self.linear_vel_base * (1 - abs(err))
-                    ang = -err * self.angular_vel_base
-                    self.twist.linear.x = max(self.min_lin, lin)
-                    self.twist.angular.z = ang
-                    if abs(ang) > 0.2:
+                    # Velocity commands
+                    self.twist.linear.x = self.linear_vel_base * (1 - abs(err))
+                    self.twist.angular.z = -err * self.angular_vel_base
+                    # Minor forward during sharp turns
+                    if abs(self.twist.angular.z) > 0.1:
                         self.twist.linear.x = self.turn_linear
-                    self.last_dir = 1 if ang > 0 else -1
-                    detected = True
-
-        # Debounce lost-line: only recover after threshold
-        if detected:
-            self.lost_count = 0
+                    # Update last_dir
+                    self.last_dir = 1 if self.twist.angular.z > 0 else -1
+                else:
+                    self._recover(hsv, w)
+            else:
+                self._recover(hsv, w)
         else:
-            self.lost_count += 1
-
-        if self.lost_count >= self.lost_threshold:
             self._recover(hsv, w)
 
+        # Publish command
         self.cmd_pub.publish(self.twist)
 
         # Debug view
-        cv2.imshow("ROI Mask", mask_roi)
+        cv2.imshow("ROI Mask", mask)
         cv2.waitKey(1)
 
-        # Periodic save
+        # Save image periodically
         now = rospy.Time.now()
         if now - self.last_saved_time >= rospy.Duration(self.save_interval):
-            self._save_image(frame)
+            self.save_image(frame)
             self.last_saved_time = now
 
     def _recover(self, hsv, width):
+        # Lost-line: detect branch in full frame
         full_mask = cv2.inRange(hsv, self.lower_black, self.upper_black)
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, self.kernel)
-        full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, self.kernel)
+        contours, _ = cv2.findContours(full_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            # choose largest contour
+            cnt = max(contours, key=cv2.contourArea)
+            x, _, w_cnt, _ = cv2.boundingRect(cnt)
+            cx = x + w_cnt/2
+            # Decide direction
+            self.last_dir = 1 if cx < width/2 else -1
+        # Rotate in place towards last_dir
+        self.twist.linear.x = 0.0
+        self.twist.angular.z = self.angular_vel_base * self.last_dir
 
-        mid = width // 2
-        left_sum = np.sum(full_mask[:, :mid])
-        right_sum = np.sum(full_mask[:, mid:])
-
-        if left_sum > right_sum and left_sum > 1000:
-            self.twist.linear.x = self.turn_linear
-            self.twist.angular.z = self.angular_vel_base
-            self.last_dir = 1
-        elif right_sum > left_sum and right_sum > 1000:
-            self.twist.linear.x = self.turn_linear
-            self.twist.angular.z = -self.angular_vel_base
-            self.last_dir = -1
-        else:
-            self.twist.linear.x = self.turn_linear * 0.5
-            self.twist.angular.z = self.angular_vel_base * self.last_dir * 0.5
-
-    def _save_image(self, img):
+    def save_image(self, img):
         ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         path = os.path.join(self.image_save_dir, f"img_{ts}.jpg")
         cv2.imwrite(path, img)
